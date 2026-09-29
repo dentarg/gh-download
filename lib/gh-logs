@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# Internal helper: the caller validates the URL and owns the output directory.
+# Run in the caller's staging directory so failed downloads can be discarded.
+set -eu
+
+die() {
+  printf 'gh download: %s\n' "$*" >&2
+  exit 1
+}
+
+[ "$#" -eq 2 ] || die 'usage: gh-logs ACTIONS_URL OUTPUT_DIR'
+command -v unzip >/dev/null 2>&1 || die 'missing required command: unzip'
+
+path=${1#https://github.com/}
+owner=${path%%/*}
+path=${path#*/}
+repo=${path%%/*}
+path=${path#*/}
+api="repos/$owner/$repo"
+output_dir=$2
+
+work_dir=$(mktemp -d './.gh-logs.XXXXXX')
+trap 'rm -rf "$work_dir"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+path=${path#actions/runs/}
+run_id=${path%%/*}
+job_id=
+case $path in */job/*) job_id=${path##*/} ;; esac
+mkdir "$output_dir"
+if [ -n "$job_id" ]; then
+  gh api --hostname github.com "$api/actions/jobs/$job_id/logs" >"$output_dir/job-$job_id.txt"
+else
+  gh api --hostname github.com "$api/actions/runs/$run_id/logs" >"$work_dir/logs.zip"
+  unzip -Z1 "$work_dir/logs.zip" >"$work_dir/paths"
+  while IFS= read -r entry; do
+    case /$entry/ in
+      //*|*/../*|*\\*) die 'log archive contains an unsafe path' ;;
+    esac
+  done <"$work_dir/paths"
+  unzip -Z -l "$work_dir/logs.zip" >"$work_dir/entries"
+  if grep -q '^l' "$work_dir/entries"; then die 'log archive contains a symlink'; fi
+  unzip -oq "$work_dir/logs.zip" -d "$output_dir"
+fi

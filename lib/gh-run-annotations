@@ -1,0 +1,50 @@
+#!/bin/sh
+
+# Internal helper: the caller supplies a validated Actions run or job URL.
+# Emit annotations as JSON on stdout; temporary files stay in the staging directory.
+set -eu
+
+die() {
+  printf 'gh download: %s\n' "$*" >&2
+  exit 1
+}
+
+[ "$#" -eq 1 ] || die 'usage: gh-run-annotations ACTIONS_URL'
+
+path=${1#https://github.com/}
+owner=${path%%/*}
+path=${path#*/}
+repo=${path%%/*}
+path=${path#*/}
+api="repos/$owner/$repo"
+
+work_dir=$(mktemp -d './.gh-run-annotations.XXXXXX')
+trap 'rm -rf "$work_dir"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+path=${path#actions/runs/}
+run_id=${path%%/*}
+job_id=
+case $path in */job/*) job_id=${path##*/} ;; esac
+if [ -n "$job_id" ]; then
+  gh api --hostname github.com "$api/actions/jobs/$job_id" >"$work_dir/job.json"
+  jq '[.]' "$work_dir/job.json" >"$work_dir/jobs.json"
+else
+  gh api --hostname github.com --paginate --slurp \
+    "$api/actions/runs/$run_id/jobs?per_page=100" >"$work_dir/job-pages.json"
+  jq '[.[].jobs[]]' "$work_dir/job-pages.json" >"$work_dir/jobs.json"
+fi
+jq -c '.[] | select(.check_run_url != null)' "$work_dir/jobs.json" >"$work_dir/jobs"
+: >"$work_dir/annotations"
+while IFS= read -r job; do
+  check_url=$(printf '%s\n' "$job" | jq -r '.check_run_url')
+  check_id=${check_url##*/}
+  case $check_id in ''|*[!0-9]*) die 'invalid check-run ID returned by GitHub' ;; esac
+  gh api --hostname github.com --paginate --slurp \
+    "$api/check-runs/$check_id/annotations?per_page=100" >"$work_dir/annotation-pages.json"
+  jq -c --argjson job "$job" --argjson id "$check_id" \
+    '.[][] + {job: $job.name, check_run_id: $id}' \
+    "$work_dir/annotation-pages.json" >>"$work_dir/annotations"
+done <"$work_dir/jobs"
+jq -s . "$work_dir/annotations"

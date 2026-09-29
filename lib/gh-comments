@@ -1,0 +1,313 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage: gh comments [--no-assets] ISSUE_OR_PR_URL
+
+Export a GitHub issue or pull request and its comments to Markdown.
+EOF
+}
+
+log() {
+  level=$1
+  shift
+  printf 'at=%s %s\n' "$level" "$*" >&2
+}
+
+die() {
+  log error "message=\"$*\""
+  exit 1
+}
+
+download_assets=true
+
+case ${1:-} in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --no-assets)
+    download_assets=false
+    shift
+    ;;
+esac
+
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
+  usage >&2
+  exit 2
+}
+
+url=$1
+url_without_query=${url%%[?#]*}
+url_without_scheme=${url_without_query#*://}
+
+case $url_without_scheme in
+  */issues/[0-9]*|*/pull/[0-9]*) ;;
+  *) die 'expected a GitHub issue or pull request URL' ;;
+esac
+
+host=${url_without_scheme%%/*}
+path=${url_without_scheme#*/}
+owner=${path%%/*}
+path=${path#*/}
+repo=${path%%/*}
+path=${path#*/}
+kind=${path%%/*}
+number=${path#*/}
+
+case $number in
+  ''|*[!0-9]*) die 'issue or pull request number must be numeric' ;;
+esac
+
+for command in gh jq curl mktemp perl; do
+  command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+
+work_dir=$(mktemp -d './.gh-comments.XXXXXX')
+restore_output=false
+
+cleanup() {
+  if [ "$restore_output" = true ]; then
+    if ! mv "$work_dir/previous-output" "$output_dir"; then
+      log error "message=\"could not restore previous export\" path=\"$work_dir/previous-output\""
+      return
+    fi
+    restore_output=false
+  fi
+  rm -rf "$work_dir"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+api="repos/$owner/$repo"
+gh api --hostname "$host" "$api/issues/$number" >"$work_dir/post.json"
+gh api --hostname "$host" --paginate --slurp \
+  "$api/issues/$number/comments?per_page=100" >"$work_dir/issue-comment-pages.json"
+jq 'add // []' "$work_dir/issue-comment-pages.json" \
+  >"$work_dir/issue-comments.json"
+
+is_pr=$(jq 'has("pull_request")' "$work_dir/post.json")
+if [ "$kind" = pull ] && [ "$is_pr" != true ]; then
+  die "URL refers to an issue, not a pull request: $url"
+fi
+
+if [ "$is_pr" = true ]; then
+  output_kind='pr'
+else
+  output_kind='issue'
+fi
+output_dir=${2:-"$repo-$output_kind-$number"}
+previous_state="$work_dir/previous-state.json"
+printf '{}\n' >"$previous_state"
+is_refresh=false
+has_history=false
+
+if [ -e "$output_dir" ]; then
+  [ -d "$output_dir" ] && [ ! -L "$output_dir" ] && \
+    [ -f "$output_dir/README.md" ] || \
+    die "refusing to replace unrecognized output path: $output_dir"
+  is_refresh=true
+
+  if [ -f "$output_dir/.gh-comments.json" ]; then
+    jq -e '.format_version == 1 and (.all_comment_ids | type == "array")' \
+      "$output_dir/.gh-comments.json" >/dev/null || \
+      die "invalid refresh state: $output_dir/.gh-comments.json"
+    state_source=$(jq -r '.source_url' "$output_dir/.gh-comments.json")
+    post_source=$(jq -r '.html_url' "$work_dir/post.json")
+    [ "$state_source" = "$post_source" ] || \
+      die "refresh state belongs to a different GitHub item"
+    cp "$output_dir/.gh-comments.json" "$previous_state"
+    has_history=true
+  else
+    post_source=$(jq -r '.html_url' "$work_dir/post.json")
+    grep -F "$post_source" "$output_dir/README.md" >/dev/null || \
+      die "refusing to refresh unrecognized legacy export: $output_dir"
+    log warn "message=\"existing export has no refresh state; creating baseline\" path=\"$output_dir\""
+  fi
+fi
+
+if [ "$is_pr" = true ]; then
+  gh api --hostname "$host" --paginate --slurp \
+    "$api/pulls/$number/reviews?per_page=100" >"$work_dir/review-pages.json"
+  jq 'add // []' "$work_dir/review-pages.json" >"$work_dir/reviews.json"
+  gh api --hostname "$host" --paginate --slurp \
+    "$api/pulls/$number/comments?per_page=100" >"$work_dir/review-comment-pages.json"
+  jq 'add // []' "$work_dir/review-comment-pages.json" \
+    >"$work_dir/review-comments.json"
+else
+  printf '[]\n' >"$work_dir/reviews.json"
+  printf '[]\n' >"$work_dir/review-comments.json"
+fi
+
+mkdir "$work_dir/result"
+fetched_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+jq -n \
+  --slurpfile issue_comments "$work_dir/issue-comments.json" \
+  --slurpfile reviews "$work_dir/reviews.json" \
+  --slurpfile review_comments "$work_dir/review-comments.json" '
+  ($issue_comments[0] | map(. + {
+    _export_type: "issue_comment",
+    _key: ("issue_comment:" + (.id | tostring)),
+    _sort_at: .created_at
+  })) +
+  ($reviews[0] | map(select(.body != null and .body != "") | . + {
+    _export_type: "review",
+    _key: ("review:" + (.id | tostring)),
+    _sort_at: (.submitted_at // .created_at)
+  })) +
+  ($review_comments[0] | map(. + {
+    _export_type: "review_comment",
+    _key: ("review_comment:" + (.id | tostring)),
+    _sort_at: .created_at
+  })) |
+  sort_by(._sort_at)
+  ' >"$work_dir/comments.json"
+
+jq \
+  --argjson has_history "$has_history" \
+  --slurpfile previous "$previous_state" '
+  ($previous[0].all_comment_ids // []) as $old_ids |
+  map(. as $comment | $comment + {
+    _is_new: ($has_history and (($old_ids | index($comment._key)) == null))
+  })
+  ' "$work_dir/comments.json" >"$work_dir/marked-comments.json"
+
+previous_fetched_at=$(jq -r '.fetched_at // empty' "$previous_state")
+new_count=$(jq '[.[] | select(._is_new)] | length' "$work_dir/marked-comments.json")
+
+jq -r \
+  --arg fetched_at "$fetched_at" \
+  --arg previous_fetched_at "$previous_fetched_at" \
+  --argjson has_history "$has_history" \
+  --slurpfile comments "$work_dir/marked-comments.json" '
+  def text: if . == null or . == "" then "_No description provided._" else . end;
+  def author: .user.login // "ghost";
+  def author_link:
+    if .user.html_url then "[@\(author)](\(.user.html_url))" else "@\(author)" end;
+  def marker:
+    "<!-- gh-comments-id: \(._key); new: \(._is_new) -->\n";
+  def new_prefix: if ._is_new then "[NEW] " else "" end;
+  def heading($label; $date):
+    "### \(new_prefix)\($label) · \($date)\n";
+  def source_link:
+    if .html_url then "[View on GitHub](\(.html_url))\n\n" else "" end;
+  def issue_comment:
+    marker + heading(author_link; .created_at) + "\n" + source_link + (.body | text) + "\n";
+  def review:
+    marker + heading("Review (\(.state // "COMMENTED")) by \(author_link)"; .submitted_at) +
+    "\n" + source_link + (.body | text) + "\n";
+  def review_comment:
+    marker + heading("Inline review comment by \(author_link)"; .created_at) + "\n" +
+    (if .path then "On `\(.path)`" + (if .line then ":\(.line)" else "" end) + "\n\n" else "" end) +
+    source_link + (.body | text) + "\n";
+
+  . as $post |
+  $comments[0] as $comments |
+  ($comments | map(select(._is_new)) | length) as $new_count |
+  "# \($post.title | gsub("[\\r\\n]+"; " "))\n\n" +
+  "> **\(if $post.pull_request then "Pull request" else "Issue" end) #\($post.number)**" +
+  " by \($post | author_link) · \($post.state | ascii_upcase) · \($post.created_at)\n>\n" +
+  "> [View on GitHub](\($post.html_url))\n>\n" +
+  "> Export fetched at \($fetched_at)" +
+  (if $has_history then
+    "\n>\n> **\($new_count) new comment\(if $new_count == 1 then "" else "s" end) since \($previous_fetched_at).**"
+   else "" end) + "\n\n" +
+  "## Original post\n\n" + ($post.body | text) + "\n\n" +
+  "## Comments\n\n" +
+  (if ($comments | length) == 0 then "_No comments._\n"
+   else ($comments | map(
+     if ._export_type == "issue_comment" then issue_comment
+     elif ._export_type == "review" then review
+     else review_comment end
+   ) | join("\n")) end)
+  ' "$work_dir/post.json" >"$work_dir/result/README.md"
+
+jq -n \
+  --arg source_url "$(jq -r '.html_url' "$work_dir/post.json")" \
+  --arg fetched_at "$fetched_at" \
+  --arg previous_fetched_at "$previous_fetched_at" \
+  --slurpfile comments "$work_dir/marked-comments.json" '{
+  format_version: 1,
+  source_url: $source_url,
+  fetched_at: $fetched_at,
+  previous_fetched_at: (
+    if $previous_fetched_at == "" then null else $previous_fetched_at end
+  ),
+  all_comment_ids: [$comments[0][]._key],
+  new_comment_ids: [$comments[0][] | select(._is_new) | ._key]
+  }' >"$work_dir/result/.gh-comments.json"
+
+extract_asset_urls() {
+  # GitHub currently stores uploaded issue assets on these canonical hosts.
+  sed 's/&amp;/\&/g' "$1" |
+    grep -Eo "https://(github\\.com/user-attachments/(assets|files)|(private-)?user-images\\.githubusercontent\\.com|github-production-user-asset-[^.]+\\.s3\\.amazonaws\\.com)/[^ <>)\"']+" |
+    sed 's/[.,;:]$//' |
+    sort -u || true
+}
+
+asset_count=0
+if [ "$download_assets" = true ]; then
+  extract_asset_urls "$work_dir/result/README.md" >"$work_dir/asset-urls"
+  if [ -s "$work_dir/asset-urls" ]; then
+    mkdir "$work_dir/result/assets"
+    token=$(gh auth token --hostname "$host" 2>/dev/null) || token=
+    asset_index=0
+    while IFS= read -r asset_url; do
+      asset_index=$((asset_index + 1))
+      asset_path=${asset_url%%\?*}
+      asset_name=${asset_path##*/}
+      case $asset_name in
+        ''|assets|files) asset_name=attachment ;;
+      esac
+      asset_name=$(printf '%s' "$asset_name" | sed 's/[^A-Za-z0-9._-]/-/g')
+      local_name=$(printf '%03d-%s' "$asset_index" "$asset_name")
+
+      if [ -n "$token" ]; then
+        if printf 'header = "Authorization: Bearer %s"\n' "$token" |
+          curl --config - --fail --location --silent --show-error \
+            --output "$work_dir/result/assets/$local_name" "$asset_url"; then
+          downloaded=true
+        else
+          downloaded=false
+        fi
+      else
+        if curl --fail --location --silent --show-error \
+          --output "$work_dir/result/assets/$local_name" "$asset_url"; then
+          downloaded=true
+        else
+          downloaded=false
+        fi
+      fi
+
+      if [ "$downloaded" = true ]; then
+        asset_count=$((asset_count + 1))
+        ASSET_URL=$asset_url ASSET_LOCAL="assets/$local_name" \
+          perl -pi -e 's/\Q$ENV{ASSET_URL}\E/$ENV{ASSET_LOCAL}/g' \
+          "$work_dir/result/README.md"
+      else
+        rm -f "$work_dir/result/assets/$local_name"
+        log warn "message=\"could not download asset\" url=\"$asset_url\""
+      fi
+    done <"$work_dir/asset-urls"
+    rmdir "$work_dir/result/assets" 2>/dev/null || true
+  fi
+fi
+
+if [ "$is_refresh" = true ]; then
+  previous_output="$work_dir/previous-output"
+  mv "$output_dir" "$previous_output"
+  restore_output=true
+  if ! mv "$work_dir/result" "$output_dir"; then
+    die "could not replace existing export: $output_dir"
+  fi
+  restore_output=false
+else
+  mv "$work_dir/result" "$output_dir"
+fi
+trap - EXIT HUP INT TERM
+cleanup
+
+log info "message=\"export complete\" path=\"$output_dir\" assets=$asset_count new_comments=$new_count refreshed=$is_refresh"

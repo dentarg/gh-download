@@ -1,0 +1,116 @@
+#!/bin/sh
+
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage: gh download [--no-assets] URL [PARENT_DIR]
+
+Download a GitHub issue, pull request, Actions run, or job.
+Download under PARENT_DIR (default: current directory). Existing issues are refreshed.
+Missing parent directories are created.
+EOF
+}
+
+die() {
+  printf 'gh download: %s\n' "$*" >&2
+  exit 1
+}
+
+no_assets=false
+case ${1:-} in
+  -h|--help) usage; exit 0 ;;
+  --no-assets) no_assets=true; shift ;;
+esac
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || { usage >&2; exit 2; }
+
+url=${1%%[?#]*}
+url=${url%/}
+printf '%s\n' "$url" | grep -Eq \
+  '^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9_.-]+/((issues|pull)/[0-9]+|actions/runs/[0-9]+(/job/[0-9]+)?)$' ||
+  die 'expected a GitHub issue, pull request, Actions run, or job URL'
+
+path=${url#https://github.com/}
+path=${path#*/}
+repo=${path%%/*}
+path=${path#*/}
+kind=${path%%/*}
+case $repo in .|..) die 'invalid repository name' ;; esac
+[ "$kind" != actions ] || [ "$no_assets" = false ] ||
+  die '--no-assets only applies to issues and pull requests'
+
+for command in gh jq mktemp; do
+  command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+
+lib=$(CDPATH='' cd -- "$(dirname -- "$0")/lib" && pwd)
+output_parent=${2-.}
+case $output_parent in
+  '') die 'parent directory must not be empty' ;;
+  /*) parent=$output_parent ;;
+  *) parent=$PWD/$output_parent ;;
+esac
+mkdir -p "$parent"
+
+case $kind in
+  issues) prefix="$repo-issue-${path##*/}" ;;
+  pull) prefix="$repo-pr-${path##*/}" ;;
+  actions)
+    run_path=${path#actions/runs/}
+    prefix="$repo-run-${run_path%%/*}"
+    case $run_path in */job/*) prefix="$prefix-job-${run_path##*/}" ;; esac
+    ;;
+esac
+
+existing_issue=
+if [ "$kind" = issues ]; then
+  for candidate in "$parent/$prefix" "$parent/$prefix-"*; do
+    [ -d "$candidate" ] && [ ! -L "$candidate" ] || continue
+    [ -f "$candidate/.gh-comments.json" ] || continue
+    if jq -e --arg url "$url" '.source_url == $url' \
+      "$candidate/.gh-comments.json" >/dev/null 2>&1; then
+      [ -z "$existing_issue" ] ||
+        die 'multiple exports match this issue; keep only one in the selected parent directory'
+      existing_issue=$candidate
+    fi
+  done
+fi
+
+work_dir=$(mktemp -d "$parent/.gh-download.XXXXXX")
+destination=
+complete=false
+cleanup() {
+  rm -rf "$work_dir"
+  if [ "$complete" = false ] && [ -n "$destination" ]; then
+    rm -rf "$destination"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+(
+  cd "$work_dir"
+  if [ "$kind" = actions ]; then
+    sh "$lib/gh-logs" "$url" export
+    sh "$lib/gh-run-annotations" "$url" >export/annotations.json
+  elif [ "$no_assets" = true ]; then
+    sh "$lib/gh-comments" --no-assets "$url" "${existing_issue:-export}"
+  else
+    sh "$lib/gh-comments" "$url" "${existing_issue:-export}"
+  fi
+)
+
+if [ -n "$existing_issue" ]; then
+  printf '%s/%s\n' "${output_parent%/}" "${existing_issue##*/}"
+  exit 0
+fi
+
+# Reserve a unique directory without replacing any previous download.
+destination=$(mktemp -d "$parent/$prefix-XXXXXX")
+for entry in "$work_dir/export"/* "$work_dir/export"/.[!.]* "$work_dir/export"/..?*; do
+  [ -e "$entry" ] || [ -L "$entry" ] || continue
+  mv "$entry" "$destination/"
+done
+complete=true
+printf '%s/%s\n' "${output_parent%/}" "${destination##*/}"
