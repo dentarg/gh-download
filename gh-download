@@ -7,7 +7,7 @@ usage() {
 Usage: gh download [--no-assets] URL [PARENT_DIR]
 
 Download a GitHub issue, pull request, Actions run, or job.
-Download under PARENT_DIR (default: current directory). Existing issues are refreshed.
+Download under PARENT_DIR (default: current directory). Existing issues and pull requests are refreshed.
 Missing parent directories are created.
 EOF
 }
@@ -62,16 +62,16 @@ case $kind in
     ;;
 esac
 
-existing_issue=
-if [ "$kind" = issues ]; then
+existing_export=
+if [ "$kind" = issues ] || [ "$kind" = pull ]; then
   for candidate in "$parent/$prefix" "$parent/$prefix-"*; do
     [ -d "$candidate" ] && [ ! -L "$candidate" ] || continue
     [ -f "$candidate/.gh-comments.json" ] || continue
     if jq -e --arg url "$url" '.source_url == $url' \
       "$candidate/.gh-comments.json" >/dev/null 2>&1; then
-      [ -z "$existing_issue" ] ||
-        die 'multiple exports match this issue; keep only one in the selected parent directory'
-      existing_issue=$candidate
+      [ -z "$existing_export" ] ||
+        die 'multiple exports match this issue or pull request; keep only one in the selected parent directory'
+      existing_export=$candidate
     fi
   done
 fi
@@ -95,14 +95,14 @@ trap 'exit 143' HUP TERM
     sh "$lib/gh-logs" "$url" export
     sh "$lib/gh-run-annotations" "$url" >export/annotations.json
   elif [ "$no_assets" = true ]; then
-    sh "$lib/gh-comments" --no-assets "$url" "${existing_issue:-export}"
+    sh "$lib/gh-comments" --no-assets "$url" "${existing_export:-export}"
   else
-    sh "$lib/gh-comments" "$url" "${existing_issue:-export}"
+    sh "$lib/gh-comments" "$url" "${existing_export:-export}"
   fi
 )
 
-if [ -n "$existing_issue" ]; then
-  printf '%s/%s\n' "${output_parent%/}" "${existing_issue##*/}"
+if [ -n "$existing_export" ]; then
+  printf '%s/%s\n' "${output_parent%/}" "${existing_export##*/}"
   exit 0
 fi
 

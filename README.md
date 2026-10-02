@@ -36,7 +36,8 @@ current directory (`.`). Missing parents are created. Relative and absolute
 paths are accepted, including paths with spaces.
 
 New downloads create a directory with a descriptive name and a random
-six-character suffix. Issue downloads reuse a matching existing export:
+six-character suffix. Issue and pull request downloads reuse a matching existing
+export:
 
 - Issues: `REPO-issue-NUMBER-XXXXXX`
 - Pull requests: `REPO-pr-NUMBER-XXXXXX`
@@ -59,15 +60,16 @@ are saved in `assets/`, with their links rewritten to relative paths. External
 attachments are left untouched. Failed attachment downloads retain their remote
 links and report a warning. Use `--no-assets` to skip attachment downloads.
 
-Repeating an issue download refreshes its existing export in the selected
-parent directory. Matching checks both the `REPO-issue-NUMBER[-SUFFIX]` directory
-name and the source URL in `.gh-comments.json`, so repositories with the same
+Repeating an issue or pull request download refreshes its existing export in the
+selected parent directory. Matching checks both the `REPO-issue-NUMBER[-SUFFIX]`
+or `REPO-pr-NUMBER[-SUFFIX]` directory name and the source URL in
+`.gh-comments.json`, so repositories with the same
 name are kept separate. Newly discovered comments are marked `[NEW]`, and the
 metadata retains the comment history. If no match exists, a new directory is
 created. If multiple exports match, the command fails; keep only one matching
 export in that parent directory before retrying.
 
-Pull request and Actions downloads still create a separate snapshot each time.
+Actions downloads still create a separate snapshot each time.
 Conversation exports include `.gh-comments.json` alongside the Markdown and
 attachments.
 
@@ -79,8 +81,8 @@ Runs without annotations produce `[]`.
 
 Unrelated files and directories in the parent are preserved. Downloads are
 staged before publishing. Failed new downloads remove their staging and output
-directories; failed issue refreshes preserve the previous export. Newly created parent directories may
-remain after failure. Expired or unavailable Actions logs cause the command to
+directories; failed issue and pull request refreshes preserve the previous export.
+Newly created parent directories may remain after failure. Expired or unavailable Actions logs cause the command to
 fail.
 
 ## Development

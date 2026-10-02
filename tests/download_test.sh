@@ -14,6 +14,9 @@ done
 case $endpoint in *"${FAIL_ENDPOINT:-NEVER}"*) exit 1 ;; esac
 case $endpoint in
   */issues/*/comments*) printf '%s\n' '[[{"id":'"${COMMENT_ID:-1}"',"body":"A comment","created_at":"2026-09-29","user":{"login":"bob"}}]]' ;;
+  */issues/43) printf '%s\n' '{"number":43,"title":"Change","body":"Description","state":"open","created_at":"2026-09-29","html_url":"https://github.com/acme/widgets/pull/43","user":{"login":"alice"},"pull_request":{}}' ;;
+  */pulls/43/reviews*) printf '%s\n' '[[{"id":10,"body":"Looks good","state":"APPROVED","submitted_at":"2026-09-29","user":{"login":"bob"}}]]' ;;
+  */pulls/43/comments*) printf '%s\n' '[[]]' ;;
   */issues/*) printf '%s\n' '{"number":42,"title":"Problem","body":"Description","state":"open","created_at":"2026-09-29","html_url":"https://github.com/acme/widgets/issues/42","user":{"login":"alice"}}' ;;
   */actions/jobs/*/logs) printf 'job output\n' ;;
   */actions/runs/*/logs) cat "$ARCHIVE" ;;
@@ -41,6 +44,17 @@ grep -q '# Problem' "$first/README.md"
 grep -Fq '[NEW]' "$second/README.md"
 jq -e '.previous_fetched_at != null and .new_comment_ids == ["issue_comment:2"]' "$second/.gh-comments.json" >/dev/null
 printf 'ok - issue download refreshes the same directory and preserves history\n'
+
+first_pr=$("$root/gh-download" "$url/pull/43?x=1#comment" 'nested/reviews')
+case $first_pr in nested/reviews/widgets-pr-43-??????) ;; *) exit 1 ;; esac
+second_pr=$(COMMENT_ID=2 "$root/gh-download" "$url/pull/43/" 'nested/reviews')
+[ "$first_pr" = "$second_pr" ]
+set -- nested/reviews/*
+[ "$#" -eq 1 ]
+grep -q 'Looks good' "$second_pr/README.md"
+grep -Fq '[NEW]' "$second_pr/README.md"
+jq -e '.source_url == "https://github.com/acme/widgets/pull/43" and .previous_fetched_at != null and .new_comment_ids == ["issue_comment:2"]' "$second_pr/.gh-comments.json" >/dev/null
+printf 'ok - pull request download refreshes the same directory and preserves history\n'
 
 mkdir current
 (
