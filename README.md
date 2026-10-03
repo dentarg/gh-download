@@ -79,6 +79,12 @@ array of check annotations with `job` and `check_run_id` fields. Workflow
 annotations cover the run's jobs; a job URL includes only that job's annotations.
 Runs without annotations produce `[]`.
 
+Job logs and extracted workflow logs are sanitized before publishing. Control
+characters are rendered visibly (for example, ESC becomes `^[`) so viewing the
+files does not execute terminal escape sequences. Tabs and newlines are preserved;
+non-ASCII bytes use `cat -v` notation. Exported logs therefore lose terminal colors
+and do not preserve the original bytes. ZIP archives are extracted before sanitizing.
+
 Unrelated files and directories in the parent are preserved. Downloads are
 staged before publishing. Failed new downloads remove their staging and output
 directories; failed issue and pull request refreshes preserve the previous export.

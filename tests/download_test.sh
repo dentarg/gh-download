@@ -8,17 +8,29 @@ cat >"$work/bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
 [ "$1" = api ] || exit 99
+allow_escape_sequences=false
 for arg do
-  case $arg in repos/*) endpoint=$arg ;; esac
+  case $arg in
+    repos/*) endpoint=$arg ;;
+    --allow-escape-sequences) allow_escape_sequences=true ;;
+  esac
 done
 case $endpoint in *"${FAIL_ENDPOINT:-NEVER}"*) exit 1 ;; esac
+case $endpoint in
+  */logs)
+    if [ "$allow_escape_sequences" = false ]; then
+      printf '%s\n' 'the response contains terminal escape sequences; pass --allow-escape-sequences to output it anyway' >&2
+      exit 1
+    fi
+    ;;
+esac
 case $endpoint in
   */issues/*/comments*) printf '%s\n' '[[{"id":'"${COMMENT_ID:-1}"',"body":"A comment","created_at":"2026-09-29","user":{"login":"bob"}}]]' ;;
   */issues/43) printf '%s\n' '{"number":43,"title":"Change","body":"Description","state":"open","created_at":"2026-09-29","html_url":"https://github.com/acme/widgets/pull/43","user":{"login":"alice"},"pull_request":{}}' ;;
   */pulls/43/reviews*) printf '%s\n' '[[{"id":10,"body":"Looks good","state":"APPROVED","submitted_at":"2026-09-29","user":{"login":"bob"}}]]' ;;
   */pulls/43/comments*) printf '%s\n' '[[]]' ;;
   */issues/*) printf '%s\n' '{"number":42,"title":"Problem","body":"Description","state":"open","created_at":"2026-09-29","html_url":"https://github.com/acme/widgets/issues/42","user":{"login":"alice"}}' ;;
-  */actions/jobs/*/logs) printf 'job output\n' ;;
+  */actions/jobs/*/logs) cat "$LOG_FIXTURE" ;;
   */actions/runs/*/logs) cat "$ARCHIVE" ;;
   */actions/jobs/*) printf '%s\n' '{"name":"build","check_run_url":"https://api.github.com/repos/acme/widgets/check-runs/30"}' ;;
   */actions/runs/*/jobs*) printf '%s\n' '[{"jobs":[{"name":"build","check_run_url":"https://api.github.com/repos/acme/widgets/check-runs/30"}]}]' ;;
@@ -68,19 +80,28 @@ mkdir current
 )
 printf 'ok - omitted parent creates a generated directory under current directory\n'
 
-job=$("$root/gh-download" "$url/actions/runs/10/job/20" "$work/jobs/output")
+# Include color, clipboard, screen/cursor controls, and an eight-bit CSI.
+LOG_FIXTURE="$work/raw-log.txt"
+export LOG_FIXTURE
+printf '\033[32mjob output\033[0m\n\033]52;c;payload\007\033[2J\033[H\rhidden\b\000\177\2332J\tend\n' >"$LOG_FIXTURE"
+cat >expected-job.txt <<'EOF'
+^[[32mjob output^[[0m
+^[]52;c;payload^G^[[2J^[[H^Mhidden^H^@^?M-^[2J	end
+EOF
+job=$("$root/gh-download" "$url/actions/runs/10/job/20?pr=1006" "$work/jobs/output")
 case $job in "$work/jobs/output/widgets-run-10-job-20-"??????) ;; *) exit 1 ;; esac
-[ "$(cat "$job/job-20.txt")" = 'job output' ]
+cmp expected-job.txt "$job/job-20.txt"
 jq -e 'length == 2 and .[0].job == "build" and .[0].check_run_id == 30' "$job/annotations.json" >/dev/null
 printf 'ok - job logs and annotations under absolute parent\n'
 
-printf 'run output\n' >archive/step.txt
-(cd archive && zip -q "$work/logs.zip" step.txt)
+mkdir -p 'archive/build job'
+cp "$LOG_FIXTURE" 'archive/build job/step.txt'
+(cd archive && zip -q "$work/logs.zip" 'build job/step.txt')
 ARCHIVE="$work/logs.zip"
 export ARCHIVE
 run=$("$root/gh-download" "$url/actions/runs/10" runs)
 case $run in runs/widgets-run-10-??????) ;; *) exit 1 ;; esac
-cmp archive/step.txt "$run/step.txt"
+cmp expected-job.txt "$run/build job/step.txt"
 jq -e 'length == 2' "$run/annotations.json" >/dev/null
 printf 'ok - workflow archive and annotations in generated directory\n'
 

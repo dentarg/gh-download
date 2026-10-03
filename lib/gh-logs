@@ -30,10 +30,11 @@ run_id=${path%%/*}
 job_id=
 case $path in */job/*) job_id=${path##*/} ;; esac
 mkdir "$output_dir"
+# Preserve raw log and archive bytes; both responses are written only to files.
 if [ -n "$job_id" ]; then
-  gh api --hostname github.com "$api/actions/jobs/$job_id/logs" >"$output_dir/job-$job_id.txt"
+  gh api --hostname github.com --allow-escape-sequences "$api/actions/jobs/$job_id/logs" >"$output_dir/job-$job_id.txt"
 else
-  gh api --hostname github.com "$api/actions/runs/$run_id/logs" >"$work_dir/logs.zip"
+  gh api --hostname github.com --allow-escape-sequences "$api/actions/runs/$run_id/logs" >"$work_dir/logs.zip"
   unzip -Z1 "$work_dir/logs.zip" >"$work_dir/paths"
   while IFS= read -r entry; do
     case /$entry/ in
@@ -44,3 +45,15 @@ else
   if grep -q '^l' "$work_dir/entries"; then die 'log archive contains a symlink'; fi
   unzip -oq "$work_dir/logs.zip" -d "$output_dir"
 fi
+
+# Render control and high-bit bytes visibly, preserving tabs and newlines.
+# Process every extracted file, including nested logs, without parsing filenames.
+find "$output_dir" -type f -exec sh -c '
+  set -eu
+  sanitized=$1
+  shift
+  for log do
+    LC_ALL=C cat -v "$log" >"$sanitized"
+    mv "$sanitized" "$log"
+  done
+' sh "$work_dir/sanitized.txt" {} +
